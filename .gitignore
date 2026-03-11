@@ -1,0 +1,23 @@
+# Development
+CLAUDE.md
+.venv/
+.python-version
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build
+dist/
+*.egg-info/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code runtime
+.claude/memory/

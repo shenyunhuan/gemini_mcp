@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "geminimcp"
+version = "2.2.0"
+description = "MCP-to-ACP bridge: exposes Gemini CLI as an MCP tool via the Agent Client Protocol."
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.26.0",
+    "pydantic>=2.0",
+]
+license = { text = "MIT" }
+keywords = ["mcp", "fastmcp", "gemini"]
+
+[project.scripts]
+geminimcp = "geminimcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/geminimcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/geminimcp"]
