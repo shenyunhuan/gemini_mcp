@@ -1,10 +1,10 @@
-# ACP 协议边界 — geminimcp v2.2.0
+# ACP 协议边界 — geminimcp v2.3.0
 
 ACP v1 (protocolVersion: 1) 实现覆盖。
 
 规范: https://agentclientprotocol.com
 
-Gemini CLI: v0.34.0-preview.0 (2026-03-11)
+Gemini CLI: v0.36.0-nightly (2026-03-18)
 
 ## 已实现的方法
 
@@ -129,6 +129,31 @@ sandbox=false → yolo; sandbox=true → default
 | 计划模式 | `--approval-mode plan` | 只读，反映在 ACP availableModes |
 | `--experimental-acp` | 已弃用 | 使用 `--acp` 替代 |
 
+## MCP Tools (v2.3.0)
+
+| Tool | 用途 | 备注 |
+| ---- | ---- | ---- |
+| `gemini` | 发送 prompt 并收集响应 | 主工具，支持 vision/context/MCP 过滤 |
+| `list_models` | 列出可用模型和 bridge 状态 | 只读，含当前模型/进程状态 |
+| `list_sessions` | 列出活跃 ACP session | 只读，含 workspace/turn count |
+| `reset_session` | 重置指定或全部 session | 下次调用创建新 session |
+
+## Approval Modes (v2.3.0)
+
+| 参数值 | ACP mode ID | 行为 |
+| ------ | ----------- | ---- |
+| `yolo` | `yolo` | 全部自动批准（默认） |
+| `auto_edit` | `autoEdit` | 编辑自动批准，其他需审批 |
+| `default` | `default` | 每个操作需要审批 |
+| `plan` | `plan` | 只读模式 |
+
+替代旧版 `sandbox: bool` 参数。支持 fallback: yolo 不可用时降级到 autoEdit。
+
+## MCP Server 过滤 (v2.3.0)
+
+`gemini` tool 的 `allowed_mcp_servers` 参数可按名称过滤透传的 MCP server。
+传 `None` 加载所有发现的 server（默认行为）；传名称列表只加载匹配的 server。
+
 ## 已知限制
 
 1. **模型启动时固定**: `--model` 仅在进程启动时生效
@@ -137,6 +162,7 @@ sandbox=false → yolo; sandbox=true → default
 4. **无 token 统计**: ACP v1 响应不包含用量数据
 5. **音频**: Agent 报告支持但 bridge 未实现
 6. **resource_link**: Gemini API 以 400 拒绝（不支持 octet-stream）
+7. **`--include-directories`**: CLI 级别标志，ACP session/new 未暴露对应参数
 
 ## 升级检查清单
 
@@ -147,7 +173,10 @@ sandbox=false → yolo; sandbox=true → default
 - [x] `session/load` — 用于 eviction 恢复（v2.2.0）
 - [x] `resource` ContentBlock — 通过 `context` 参数注入文本（v2.2.0）
 - [x] HTTP/SSE MCP 传输透传 — 三种格式全支持（v2.2.0）
+- [x] 多 tool 拆分 — list_models, list_sessions, reset_session（v2.3.0）
+- [x] 细粒度 approval mode — 4 种模式替代 sandbox bool（v2.3.0）
+- [x] MCP server 过滤 — allowed_mcp_servers 参数（v2.3.0）
 - [ ] Audio ContentBlock 支持
 - [ ] 策略引擎 ACP 集成
-- [ ] `--include-directories` 透传
+- [ ] `--include-directories` 透传（待 ACP 支持）
 - [ ] ACP 响应中的 token 用量

@@ -160,12 +160,35 @@ codex mcp add gemini -- geminimcp
 - `Client → Codex → Gemini`: Codex 内部调用 Gemini MCP
 - `Client → Gemini → Codex`: Gemini 内部调用 Codex MCP
 
+## MCP Tools
+
+| Tool | 用途 |
+|------|------|
+| `gemini` | 发送 prompt，收集 Gemini 响应（主工具） |
+| `list_models` | 列出可用模型、approval mode 和 bridge 状态 |
+| `list_sessions` | 列出活跃 ACP session |
+| `reset_session` | 重置指定或全部 session |
+
+### `gemini` 主要参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROMPT` | (必需) | 发给 Gemini 的指令 |
+| `cd` | (必需) | 工作区根目录 |
+| `model` | `gemini-3.1-pro-preview` | 模型选择（flash / pro） |
+| `approval_mode` | `yolo` | 工具审批模式：`yolo` / `auto_edit` / `default` / `plan` |
+| `image_path` | `""` | 图片路径（vision 分析） |
+| `context` | `""` | 注入 ACP resource ContentBlock 的文本上下文 |
+| `allowed_mcp_servers` | `None` | 过滤 Gemini 加载的 MCP server（None=全部） |
+
 ## 设计要点
 
 - **跨平台 I/O**: 后台线程 + Queue 实现带超时的非阻塞管道读取（pipe readline 在所有平台都无原生 timeout）
 - **会话管理**: per-workspace session, 8-turn eviction + session/load 恢复
+- **Approval Mode**: 4 种审批模式（yolo/auto_edit/default/plan），支持 fallback
 - **429 降级**: pro 容量不足时自动重试 flash
 - **MCP 透传**: 自动发现 user/project/extension 的 MCP server 配置，注入 ACP session（支持 stdio/http/sse）
+- **MCP 过滤**: `allowed_mcp_servers` 参数按名称过滤透传的 MCP server
 - **多模态**: image ContentBlock (vision) + resource ContentBlock (context 注入)
 - **权限自动审批**: 拦截 `session/request_permission`，自动选择首选项，防止子进程挂起
 

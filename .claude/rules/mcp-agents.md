@@ -10,15 +10,19 @@ description: Gemini MCP (ACP bridge) routing and delegation rules
 ## Tool Signature
 
 ```
-mcp__gemini__gemini(PROMPT, cd, model?, sandbox?, image_path?, context?)
+mcp__gemini__gemini(PROMPT, cd, model?, approval_mode?, image_path?, context?, allowed_mcp_servers?)
+mcp__gemini__list_models()
+mcp__gemini__list_sessions()
+mcp__gemini__reset_session(workspace?)
 ```
 
 | Param | Key Values |
 | ----- | ---------- |
 | model | `gemini-3-flash-preview` (fast/cheap) · `gemini-3.1-pro-preview` (powerful) |
-| sandbox | `false` → yolo · `true` → approval mode |
+| approval_mode | `yolo` (default) · `auto_edit` · `default` (safest) · `plan` (read-only) |
 | image_path | Optional: image file path for vision analysis |
 | context | Optional: text injected as ACP resource ContentBlock |
+| allowed_mcp_servers | Optional: list of MCP server names to load (None = all) |
 
 ## Capabilities
 

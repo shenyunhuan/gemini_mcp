@@ -160,12 +160,35 @@ With both configured:
 - `Client → Codex → Gemini`: Codex internally calls Gemini MCP
 - `Client → Gemini → Codex`: Gemini internally calls Codex MCP
 
+## MCP Tools
+
+| Tool | Purpose |
+|------|---------|
+| `gemini` | Send prompt, collect Gemini response (main tool) |
+| `list_models` | List available models, approval modes, and bridge status |
+| `list_sessions` | List active ACP sessions |
+| `reset_session` | Reset specific or all sessions |
+
+### `gemini` Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `PROMPT` | (required) | Instruction to send to Gemini |
+| `cd` | (required) | Workspace root directory |
+| `model` | `gemini-3.1-pro-preview` | Model selection (flash / pro) |
+| `approval_mode` | `yolo` | Tool approval mode: `yolo` / `auto_edit` / `default` / `plan` |
+| `image_path` | `""` | Image file path (vision analysis) |
+| `context` | `""` | Text context injected as ACP resource ContentBlock |
+| `allowed_mcp_servers` | `None` | Filter which MCP servers Gemini loads (None=all) |
+
 ## Design Highlights
 
 - **Cross-platform I/O**: Background thread + Queue for non-blocking pipe reads with timeout (no native timeout on any platform)
 - **Session management**: Per-workspace sessions, 8-turn eviction + session/load recovery
+- **Approval modes**: 4 approval modes (yolo/auto_edit/default/plan) with fallback support
 - **429 fallback**: Auto-retry with flash when pro hits capacity limits
 - **MCP passthrough**: Auto-discovers user/project/extension MCP server configs, injects into ACP sessions (stdio/http/sse)
+- **MCP filtering**: `allowed_mcp_servers` parameter filters passthrough MCP servers by name
 - **Multimodal**: image ContentBlock (vision) + resource ContentBlock (context injection)
 - **Auto-approval**: Intercepts `session/request_permission`, auto-selects first option to prevent subprocess hangs
 

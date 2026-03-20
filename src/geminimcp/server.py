@@ -27,16 +27,53 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, Tuple
 
 _MIME_MAP = {
-    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
 }
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 mcp = FastMCP("Gemini MCP Server")
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
+
+# Known models (from ACP session/new discovery + CLI docs).
+# auto-* are internal routing IDs, not valid --model values.
+_KNOWN_MODELS = [
+    {
+        "id": "auto-gemini-3",
+        "description": "Auto-routes between pro and flash (CLI default)",
+        "auto": True,
+    },
+    {
+        "id": "auto-gemini-2.5",
+        "description": "Auto-routes between 2.5-pro and 2.5-flash",
+        "auto": True,
+    },
+    {"id": "gemini-3.1-pro-preview", "description": "Latest pro model", "auto": False},
+    {
+        "id": "gemini-3-flash-preview",
+        "description": "Latest flash model",
+        "auto": False,
+    },
+    {"id": "gemini-2.5-pro", "description": "Previous gen pro", "auto": False},
+    {"id": "gemini-2.5-flash", "description": "Previous gen flash", "auto": False},
+    {"id": "gemini-2.5-flash-lite", "description": "Lightweight flash", "auto": False},
+]
+
+# Valid approval modes (ACP uses camelCase internally)
+_APPROVAL_MODES = {
+    "default": "default",  # Prompt for approval
+    "auto_edit": "autoEdit",  # Auto-approve edits only
+    "yolo": "yolo",  # Auto-approve all
+    "plan": "plan",  # Read-only mode
+}
 
 # Evict session after N turns to prevent context quality degradation.
 _MAX_TURNS_PER_SESSION = 8
@@ -51,6 +88,7 @@ _DRAIN_TIMEOUT = 1.5
 # ============================================================================
 # ACP Bridge — manages a long-lived gemini --acp subprocess
 # ============================================================================
+
 
 class AcpBridge:
     """Single long-lived gemini --acp process with JSON-RPC communication.
@@ -78,8 +116,11 @@ class AcpBridge:
 
     def _reader_loop(self) -> None:
         """Background thread: read stdout lines into queue."""
+        stdout = self._proc.stdout if self._proc else None
+        if stdout is None:
+            return
         try:
-            for line in iter(self._proc.stdout.readline, ""):
+            for line in iter(stdout.readline, ""):
                 stripped = line.strip()
                 if stripped:
                     self._msg_queue.put(stripped)
@@ -104,7 +145,9 @@ class AcpBridge:
                 continue
         return None
 
-    def _read_until_id(self, target_id: int, timeout: float) -> Tuple[Optional[dict], List[dict]]:
+    def _read_until_id(
+        self, target_id: int, timeout: float
+    ) -> Tuple[Optional[dict], List[dict]]:
         """Read messages until response with target_id, collecting notifications."""
         notifications: List[dict] = []
         deadline = time.time() + timeout
@@ -195,11 +238,15 @@ class AcpBridge:
         # clientCapabilities: empty — we don't handle fs/terminal callbacks.
         # Gemini CLI uses its own tools for file access and shell execution.
         rid = self._next_id()
-        self._send_locked(rid, "initialize", {
-            "protocolVersion": 1,
-            "clientCapabilities": {},
-            "clientInfo": {"name": "geminimcp", "version": VERSION},
-        })
+        self._send_locked(
+            rid,
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "geminimcp", "version": VERSION},
+            },
+        )
 
         resp, _ = self._read_until_id(rid, timeout=_INIT_TIMEOUT)
         if resp and "result" in resp:
@@ -247,11 +294,18 @@ class AcpBridge:
         self._id += 1
         return self._id
 
+    def _write(self, text: str) -> None:
+        """Write text to process stdin. Caller ensures _proc is alive."""
+        assert self._proc is not None and self._proc.stdin is not None
+        self._proc.stdin.write(text)
+        self._proc.stdin.flush()
+
     def _send_locked(self, rid: int, method: str, params: dict) -> None:
         """Send a JSON-RPC request. Caller holds _lock or is in single-thread init."""
-        msg = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        self._proc.stdin.write(msg + "\n")
-        self._proc.stdin.flush()
+        msg = json.dumps(
+            {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        )
+        self._write(msg + "\n")
 
     def _send(self, rid: int, method: str, params: dict) -> None:
         """Send a JSON-RPC request (acquires lock)."""
@@ -262,10 +316,11 @@ class AcpBridge:
         """Send a JSON-RPC notification (no id)."""
         with self._lock:
             msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params})
-            self._proc.stdin.write(msg + "\n")
-            self._proc.stdin.flush()
+            self._write(msg + "\n")
 
-    def _request(self, method: str, params: dict, timeout: float = 30) -> Tuple[Optional[dict], List[dict]]:
+    def _request(
+        self, method: str, params: dict, timeout: float = 30
+    ) -> Tuple[Optional[dict], List[dict]]:
         """Send request and wait for response."""
         rid = self._next_id()
         self._send(rid, method, params)
@@ -289,7 +344,9 @@ class AcpBridge:
     # Extension discovery
     # ------------------------------------------------------------------
 
-    def _discover_mcp_servers(self, cwd: str = "") -> List[Dict[str, Any]]:
+    def _discover_mcp_servers(
+        self, cwd: str = "", allowed_names: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
         """Discover MCP servers from Gemini CLI config and extensions.
 
         Sources (in order, later overrides earlier):
@@ -325,8 +382,9 @@ class AcpBridge:
                         # headers is required (array), even if empty
                         raw_headers = cfg.get("headers", [])
                         if isinstance(raw_headers, dict):
-                            entry["headers"] = [{"name": k, "value": v}
-                                                for k, v in raw_headers.items()]
+                            entry["headers"] = [
+                                {"name": k, "value": v} for k, v in raw_headers.items()
+                            ]
                         else:
                             entry["headers"] = raw_headers if raw_headers else []
                     else:
@@ -335,8 +393,9 @@ class AcpBridge:
                         # env is required (array) for stdio
                         raw_env = cfg.get("env", {})
                         if isinstance(raw_env, dict) and raw_env:
-                            entry["env"] = [{"name": k, "value": v}
-                                            for k, v in raw_env.items()]
+                            entry["env"] = [
+                                {"name": k, "value": v} for k, v in raw_env.items()
+                            ]
                         elif isinstance(raw_env, list):
                             entry["env"] = raw_env
                         else:
@@ -359,12 +418,15 @@ class AcpBridge:
                     for name, cfg in config.get("mcpServers", {}).items():
                         if name in servers:
                             continue  # project config takes precedence
-                        args = [a.replace("${extensionPath}", str(ext_path))
-                                for a in cfg.get("args", [])]
+                        args = [
+                            a.replace("${extensionPath}", str(ext_path))
+                            for a in cfg.get("args", [])
+                        ]
                         raw_env = cfg.get("env", {})
                         if isinstance(raw_env, dict) and raw_env:
-                            env_list = [{"name": k, "value": v}
-                                        for k, v in raw_env.items()]
+                            env_list = [
+                                {"name": k, "value": v} for k, v in raw_env.items()
+                            ]
                         elif isinstance(raw_env, list):
                             env_list = raw_env
                         else:
@@ -379,48 +441,71 @@ class AcpBridge:
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-        return list(servers.values())
+        result = list(servers.values())
+        if allowed_names:
+            result = [s for s in result if s["name"] in allowed_names]
+        return result
 
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
 
-    def _get_or_create_session(self, cwd: str, sandbox: bool = False) -> Tuple[Optional[str], Optional[str]]:
+    def _get_or_create_session(
+        self,
+        cwd: str,
+        approval_mode: str = "yolo",
+        allowed_mcp_servers: Optional[List[str]] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Get existing session or create new one. Returns (session_id, error)."""
         cached = self._sessions.get(cwd)
         if cached and cached["turn_count"] < _MAX_TURNS_PER_SESSION:
             return cached["session_id"], None
 
-        mcp_servers = self._discover_mcp_servers(cwd)
+        mcp_servers = self._discover_mcp_servers(cwd, allowed_names=allowed_mcp_servers)
 
         # If evicted session exists and agent supports it, try session/load
-        if cached and cached["turn_count"] >= _MAX_TURNS_PER_SESSION and self.supports_load_session():
-            resp, _ = self._request("session/load", {
-                "sessionId": cached["session_id"],
-                "cwd": cwd,
-                "mcpServers": mcp_servers if mcp_servers else [],
-            }, timeout=_SESSION_NEW_TIMEOUT)
+        if (
+            cached
+            and cached["turn_count"] >= _MAX_TURNS_PER_SESSION
+            and self.supports_load_session()
+        ):
+            resp, _ = self._request(
+                "session/load",
+                {
+                    "sessionId": cached["session_id"],
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers if mcp_servers else [],
+                },
+                timeout=_SESSION_NEW_TIMEOUT,
+            )
             if resp and "result" in resp:
                 # session/load reuses the same sessionId, resets turn count
                 modes = resp["result"].get("modes", {}).get("availableModes", [])
                 self._sessions[cwd]["turn_count"] = 0
                 self._drain()
-                if not sandbox:
-                    self._set_preferred_mode(cached["session_id"], modes)
+                self._set_mode(cached["session_id"], modes, approval_mode)
                 return cached["session_id"], None
 
         # Create new session with discovered MCP servers (project config + extensions)
-        resp, _ = self._request("session/new", {
-            "cwd": cwd,
-            "mcpServers": mcp_servers,
-        }, timeout=_SESSION_NEW_TIMEOUT)
+        resp, _ = self._request(
+            "session/new",
+            {
+                "cwd": cwd,
+                "mcpServers": mcp_servers,
+            },
+            timeout=_SESSION_NEW_TIMEOUT,
+        )
 
         # Fallback: if mcpServers caused error, retry without them
         if (not resp or "result" not in resp) and mcp_servers:
-            resp, _ = self._request("session/new", {
-                "cwd": cwd,
-                "mcpServers": [],
-            }, timeout=_SESSION_NEW_TIMEOUT)
+            resp, _ = self._request(
+                "session/new",
+                {
+                    "cwd": cwd,
+                    "mcpServers": [],
+                },
+                timeout=_SESSION_NEW_TIMEOUT,
+            )
 
         if not resp or "result" not in resp:
             err = self._extract_error(resp) if resp else "session/new timeout"
@@ -440,21 +525,39 @@ class AcpBridge:
         # Drain setup notifications (available_commands_update etc.)
         self._drain()
 
-        # Set mode based on sandbox flag
-        if not sandbox:
-            self._set_preferred_mode(sid, modes)
+        # Set approval mode
+        self._set_mode(sid, modes, approval_mode)
 
         return sid, None
 
-    def _set_preferred_mode(self, session_id: str, modes: List[Dict[str, Any]]) -> None:
-        """Set yolo or autoEdit mode. sandbox=False → yolo; fallback → autoEdit."""
+    def _set_mode(
+        self, session_id: str, modes: List[Dict[str, Any]], approval_mode: str = "yolo"
+    ) -> None:
+        """Set approval mode on the session.
+
+        approval_mode values: default, auto_edit, yolo, plan.
+        Maps to ACP mode IDs (camelCase): default, autoEdit, yolo, plan.
+        Falls back through yolo → autoEdit if requested mode unavailable.
+        """
         mode_ids = [m.get("id") for m in modes]
-        for preferred in ("yolo", "autoEdit"):
-            if preferred in mode_ids:
-                self._request("session/set_mode", {
-                    "sessionId": session_id,
-                    "modeId": preferred,
-                }, timeout=10)
+        # Map caller value to ACP id
+        target = _APPROVAL_MODES.get(approval_mode, approval_mode)
+
+        # Build preference order: requested mode first, then fallbacks
+        if target == "yolo":
+            candidates = ["yolo", "autoEdit"]
+        elif target == "autoEdit":
+            candidates = ["autoEdit"]
+        else:
+            candidates = [target]
+
+        for mode_id in candidates:
+            if mode_id in mode_ids:
+                self._request(
+                    "session/set_mode",
+                    {"sessionId": session_id, "modeId": mode_id},
+                    timeout=10,
+                )
                 self._drain(1)
                 break
 
@@ -462,13 +565,26 @@ class AcpBridge:
     # Prompt execution
     # ------------------------------------------------------------------
 
-    def prompt(self, cwd: str, text: str, model: str = "", sandbox: bool = False,
-               image_path: str = "", context: str = "") -> Dict[str, Any]:
+    def prompt(
+        self,
+        cwd: str,
+        text: str,
+        model: str = "",
+        approval_mode: str = "yolo",
+        image_path: str = "",
+        context: str = "",
+        allowed_mcp_servers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Send a prompt and collect the full response."""
         if not self._ensure_ready(model=model):
-            return {"success": False, "error": "Failed to start gemini --acp process. Is 'gemini' in PATH?"}
+            return {
+                "success": False,
+                "error": "Failed to start gemini --acp process. Is 'gemini' in PATH?",
+            }
 
-        session_id, err = self._get_or_create_session(cwd, sandbox=sandbox)
+        session_id, err = self._get_or_create_session(
+            cwd, approval_mode=approval_mode, allowed_mcp_servers=allowed_mcp_servers
+        )
         if not session_id:
             return {"success": False, "error": err}
 
@@ -476,14 +592,16 @@ class AcpBridge:
         blocks: List[Dict[str, Any]] = []
         # Resource content block for embedded context (verified: type="resource")
         if context:
-            blocks.append({
-                "type": "resource",
-                "resource": {
-                    "uri": "context://embedded",
-                    "mimeType": "text/plain",
-                    "text": context,
-                },
-            })
+            blocks.append(
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "context://embedded",
+                        "mimeType": "text/plain",
+                        "text": context,
+                    },
+                }
+            )
         if image_path:
             img = Path(image_path)
             if img.exists() and self.supports_image():
@@ -496,10 +614,14 @@ class AcpBridge:
         # Send prompt
         start_time = time.monotonic()
         rid = self._next_id()
-        self._send(rid, "session/prompt", {
-            "sessionId": session_id,
-            "prompt": blocks,
-        })
+        self._send(
+            rid,
+            "session/prompt",
+            {
+                "sessionId": session_id,
+                "prompt": blocks,
+            },
+        )
 
         # Collect streaming response
         agent_text = ""
@@ -543,19 +665,29 @@ class AcpBridge:
 
                 if su_type == "agent_message_chunk":
                     content = update.get("content", {})
-                    agent_text += content.get("text", "") if isinstance(content, dict) else str(content)
+                    agent_text += (
+                        content.get("text", "")
+                        if isinstance(content, dict)
+                        else str(content)
+                    )
 
                 elif su_type == "agent_thought_chunk":
                     content = update.get("content", {})
-                    thought_text += content.get("text", "") if isinstance(content, dict) else str(content)
+                    thought_text += (
+                        content.get("text", "")
+                        if isinstance(content, dict)
+                        else str(content)
+                    )
 
                 elif su_type == "tool_call":
-                    tool_calls.append({
-                        "id": update.get("toolCallId", ""),
-                        "title": update.get("title", ""),
-                        "kind": update.get("kind", ""),
-                        "status": update.get("status", ""),
-                    })
+                    tool_calls.append(
+                        {
+                            "id": update.get("toolCallId", ""),
+                            "title": update.get("title", ""),
+                            "kind": update.get("kind", ""),
+                            "status": update.get("status", ""),
+                        }
+                    )
 
                 elif su_type == "tool_call_update":
                     tcid = update.get("toolCallId")
@@ -579,12 +711,14 @@ class AcpBridge:
                     else:
                         selected = True
                     with self._lock:
-                        approve = json.dumps({
-                            "jsonrpc": "2.0", "id": req_id,
-                            "result": {"selected": selected},
-                        })
-                        self._proc.stdin.write(approve + "\n")
-                        self._proc.stdin.flush()
+                        approve = json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": {"selected": selected},
+                            }
+                        )
+                        self._write(approve + "\n")
 
         else:
             # Timeout — cancel and return partial
@@ -641,7 +775,9 @@ class AcpBridge:
         if not cached:
             return False
         try:
-            self._send_notification("session/cancel", {"sessionId": cached["session_id"]})
+            self._send_notification(
+                "session/cancel", {"sessionId": cached["session_id"]}
+            )
             return True
         except Exception:
             return False
@@ -655,8 +791,16 @@ _bridge = AcpBridge()
 # MCP tool
 # ============================================================================
 
+
 @mcp.tool(
     name="gemini",
+    annotations=ToolAnnotations(
+        title="Gemini CLI Agent",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description="""
     Invokes Gemini via ACP (Agent Client Protocol) for AI-driven tasks.
 
@@ -673,32 +817,62 @@ _bridge = AcpBridge()
     **Best practices:**
         - Sessions auto-reuse per workspace with turn-count eviction
         - ALWAYS pass `model`. Use `gemini-3.1-pro-preview` for complex tasks, `gemini-3-flash-preview` for simple tasks
-        - Set `sandbox=True` to keep default approval mode (safer for untrusted operations)
+        - Use `approval_mode` to control tool approval: yolo (default), auto_edit, default, plan
         - On 429 capacity errors, automatically retries with `gemini-3-flash-preview`
         - Pass `image_path` for vision analysis (requires agent image support)
         - Pass `context` to inject text as embedded resource (ACP resource ContentBlock)
+        - Pass `allowed_mcp_servers` to filter which MCP servers Gemini loads
     """,
-    meta={"version": VERSION, "author": "async-coding-agents-kit"},
 )
 async def gemini(
-    PROMPT: Annotated[str, "Instruction for the task to send to gemini."],
-    cd: Annotated[Path, "Set the workspace root for gemini before executing the task."],
-    sandbox: Annotated[
-        bool,
-        Field(description="When True, keeps default approval mode (safer). When False, uses yolo mode (auto-approve all). Defaults to `False`."),
-    ] = False,
+    PROMPT: Annotated[
+        str,
+        Field(description="Instruction for the task to send to Gemini."),
+    ],
+    cd: Annotated[
+        Path,
+        Field(
+            description="Set the workspace root for Gemini before executing the task."
+        ),
+    ],
     model: Annotated[
         str,
-        "REQUIRED. Pass 'gemini-3.1-pro-preview' for complex tasks, 'gemini-3-flash-preview' for simple tasks.",
+        Field(
+            description="REQUIRED. Pass 'gemini-3.1-pro-preview' for complex tasks, "
+            "'gemini-3-flash-preview' for simple tasks."
+        ),
     ] = "gemini-3.1-pro-preview",
+    approval_mode: Annotated[
+        str,
+        Field(
+            description="Tool approval mode. "
+            "'yolo': auto-approve all (default). "
+            "'auto_edit': auto-approve edits only. "
+            "'default': prompt for every action (safest). "
+            "'plan': read-only mode."
+        ),
+    ] = "yolo",
     image_path: Annotated[
         str,
-        "Optional path to an image file for vision analysis. Sent as image ContentBlock.",
+        Field(
+            description="Path to an image file for vision analysis. "
+            "Sent as image ContentBlock. Empty string means no image."
+        ),
     ] = "",
     context: Annotated[
         str,
-        "Optional text context to inject as ACP resource ContentBlock. Use for passing file contents, docs, or background info that Gemini should reference.",
+        Field(
+            description="Text context to inject as ACP resource ContentBlock. "
+            "Use for passing file contents, docs, or background info that Gemini should reference."
+        ),
     ] = "",
+    allowed_mcp_servers: Annotated[
+        Optional[List[str]],
+        Field(
+            description="Filter which MCP servers Gemini loads. "
+            "Pass a list of server names to include. None means load all discovered servers."
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Execute a Gemini session via ACP and return results."""
     if not shutil.which("gemini"):
@@ -710,15 +884,36 @@ async def gemini(
             "error": f"Workspace directory `{cd.absolute().as_posix()}` does not exist.",
         }
 
+    if approval_mode not in _APPROVAL_MODES:
+        return {
+            "success": False,
+            "error": f"Invalid approval_mode '{approval_mode}'. "
+            f"Valid values: {', '.join(_APPROVAL_MODES.keys())}",
+        }
+
     cwd = cd.absolute().as_posix()
-    result = _bridge.prompt(cwd, PROMPT, model=model, sandbox=sandbox,
-                            image_path=image_path, context=context)
+    result = _bridge.prompt(
+        cwd,
+        PROMPT,
+        model=model,
+        approval_mode=approval_mode,
+        image_path=image_path,
+        context=context,
+        allowed_mcp_servers=allowed_mcp_servers,
+    )
 
     # Session error → retry with fresh session
     if not result["success"] and result.get("SESSION_ID"):
         _bridge._sessions.pop(cwd, None)
-        result = _bridge.prompt(cwd, PROMPT, model=model, sandbox=sandbox,
-                                image_path=image_path, context=context)
+        result = _bridge.prompt(
+            cwd,
+            PROMPT,
+            model=model,
+            approval_mode=approval_mode,
+            image_path=image_path,
+            context=context,
+            allowed_mcp_servers=allowed_mcp_servers,
+        )
 
     # 429 fallback: capacity error → retry with flash model
     # Skip fallback for auto-* models (they handle routing internally)
@@ -727,17 +922,119 @@ async def gemini(
         not result["success"]
         and model != _FALLBACK_MODEL
         and not model.startswith("auto-")
-        and any(kw in result.get("error", "").lower() for kw in ("capacity", "429", "resource_exhausted", "overloaded"))
+        and any(
+            kw in result.get("error", "").lower()
+            for kw in ("capacity", "429", "resource_exhausted", "overloaded")
+        )
     ):
         _bridge._sessions.pop(cwd, None)
-        result = _bridge.prompt(cwd, PROMPT, model=_FALLBACK_MODEL, sandbox=sandbox)
+        result = _bridge.prompt(
+            cwd, PROMPT, model=_FALLBACK_MODEL, approval_mode=approval_mode
+        )
         result["fallback_model"] = _FALLBACK_MODEL
 
     return result
 
 
+@mcp.tool(
+    name="list_models",
+    annotations=ToolAnnotations(
+        title="List Available Models",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description="List available Gemini models and current bridge state. "
+    "Returns known models, current active model, and agent info.",
+)
+async def list_models() -> Dict[str, Any]:
+    """List available models and bridge status."""
+    return {
+        "models": _KNOWN_MODELS,
+        "approval_modes": list(_APPROVAL_MODES.keys()),
+        "current_model": _bridge._current_model or "(not started)",
+        "agent_info": _bridge._agent_info or None,
+        "bridge_version": VERSION,
+        "process_running": _bridge._proc is not None and _bridge._proc.poll() is None,
+    }
+
+
+@mcp.tool(
+    name="list_sessions",
+    annotations=ToolAnnotations(
+        title="List Active Sessions",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description="List all active ACP sessions managed by the bridge. "
+    "Shows workspace path, session ID, turn count, and model for each session.",
+)
+async def list_sessions() -> Dict[str, Any]:
+    """List active sessions."""
+    sessions = []
+    for workspace, info in _bridge._sessions.items():
+        sessions.append(
+            {
+                "workspace": workspace,
+                "session_id": info["session_id"],
+                "turn_count": info["turn_count"],
+                "max_turns": _MAX_TURNS_PER_SESSION,
+                "model": info.get("actual_model", ""),
+            }
+        )
+    return {
+        "sessions": sessions,
+        "count": len(sessions),
+    }
+
+
+@mcp.tool(
+    name="reset_session",
+    annotations=ToolAnnotations(
+        title="Reset Session",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description="Reset (clear) the ACP session for a workspace. "
+    "The next gemini call for this workspace will create a fresh session. "
+    "Pass workspace path, or omit to reset all sessions.",
+)
+async def reset_session(
+    workspace: Annotated[
+        str,
+        Field(description="Workspace path to reset. Empty string resets all sessions."),
+    ] = "",
+) -> Dict[str, Any]:
+    """Reset session for a workspace or all sessions."""
+    if workspace:
+        removed = _bridge._sessions.pop(workspace, None)
+        if not removed:
+            # Try matching by suffix (user might pass partial path)
+            matched = [k for k in _bridge._sessions if k.endswith(workspace)]
+            if matched:
+                for k in matched:
+                    _bridge._sessions.pop(k)
+                return {"reset": matched, "count": len(matched)}
+            return {
+                "reset": [],
+                "count": 0,
+                "message": "No session found for workspace",
+            }
+        return {"reset": [workspace], "count": 1}
+    else:
+        count = len(_bridge._sessions)
+        _bridge._sessions.clear()
+        return {"reset": "all", "count": count}
+
+
 def run() -> None:
     """Start the MCP server over stdio transport."""
     import atexit
+
     atexit.register(_bridge.shutdown)
     mcp.run(transport="stdio")
